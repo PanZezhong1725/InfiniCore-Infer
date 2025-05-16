@@ -79,6 +79,8 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
     auto dvoc = meta.dvoc;
     auto stream = rsrc.stream;
 
+    // std::cout << "ntok: " << ntok << " nreq: " << nreq << " len: " << req_lens[0] << " pos: " << req_pos[0] << std::endl;
+
     // Allocate buffers
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, stream);
     auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, stream);
@@ -188,12 +190,12 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
     auto gate_buf = gate_up_buf->slice(1, 0, di);
     auto up_buf = gate_up_buf->slice(1, di, di);
     RUN_INFINI(infiniopCreateSwiGLUDescriptor(
-        rsrc.handle, &desc_swiglu, logits_out->desc()->get(), up_buf->desc()->get(), gate_buf->desc()->get()));
+        rsrc.handle, &desc_swiglu, gate_buf->desc()->get(), up_buf->desc()->get(), gate_buf->desc()->get()));
     RUN_INFINI(infiniopGetSwiGLUWorkspaceSize(desc_swiglu, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
     RUN_INFINI(infiniopCreateGemmDescriptor(
         rsrc.handle, &desc_ffn_down, logits_in->desc()->get(),
-        logits_out->desc()->get(), rsrc.w_ffn_down[0]->desc()->get()));
+        gate_buf->desc()->get(), rsrc.w_ffn_down[0]->desc()->get()));
     RUN_INFINI(infiniopGetGemmWorkspaceSize(desc_ffn_down, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
 
@@ -215,7 +217,7 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
     infiniopRandomSampleDescriptor_t desc_sample;
     RUN_INFINI(infiniopCreateRandomSampleDescriptor(
         rsrc.handle, &desc_sample,
-        TensorDesc::create(INFINI_DTYPE_U64, {1}, {1})->get(),
+        TensorDesc::create(INFINI_DTYPE_U64, {}, {})->get(),
         TensorDesc::create(dt_logits, {dvoc}, {1})->get()));
     RUN_INFINI(infiniopGetRandomSampleWorkspaceSize(desc_sample, &temp_size));
     workspace_size = std::max(workspace_size, temp_size);
@@ -233,6 +235,17 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
             desc_attn_qkv, workspace, workspace_size,
             qkv_buf->data(), logits_out->data(),
             rsrc.w_attn_qkv[layer]->data(), 1.0, 0.0, stream));
+        // logits_out->debug();
+        // rsrc.w_attn_qkv[layer]->debug();
+        // rope
+        // auto q = qkv_buf->slice({{1, 0, nh}});
+        // auto k = qkv_buf->slice({{1, nh, nkvh}});
+
+        // auto v = qkv_buf->slice({{1, nh + nkvh, nkvh}});
+        // rsrc.w_attn_qkv[layer]->debug();
+        // q->debug();
+        // k->debug();
+        // v->debug();
         // rope
         RUN_INFINI(infiniopRoPE(
             desc_rope_q, workspace, workspace_size,
@@ -247,7 +260,12 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
             rsrc.sin_table->data(),
             rsrc.cos_table->data(),
             stream));
+        // rsrc.sin_table->debug();
 
+
+        // q->debug();
+        // k->debug();
+        // v->debug();
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto seq_len = req_lens[req];
@@ -269,32 +287,42 @@ void inferDeviceBatch(const JiugeMeta &meta, const DeviceResource &rsrc,
             desc_attn_o, workspace, workspace_size,
             logits_in->data(), o_buf->data(),
             rsrc.w_attn_out[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
-
+        o_buf->debug();
+        // rsrc.w_attn_out[layer]->debug();
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
                 logits_in->data(), logits_in->data(), ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
         }
-
+        logits_in->debug();
         // 2. FFN
         // rms_norm
         RUN_INFINI(infiniopRMSNorm(
             desc_norm, workspace, workspace_size,
             logits_out->data(), logits_in->data(),
             rsrc.w_ffn_norm[layer]->data(), stream));
+        logits_out->debug();
+        // rsrc.w_ffn_norm[layer]->debug();
         // mlp
         RUN_INFINI(infiniopGemm(
             desc_ffn_gate_up, workspace, workspace_size,
             gate_up_buf->data(), logits_out->data(), rsrc.w_ffn_gate_up[layer]->data(),
             1.0, 0.0, stream));
+        // logits_out->debug();
+        // rsrc.w_ffn_gate_up[layer]->debug();
+        gate_buf->debug();
+        up_buf->debug();
         RUN_INFINI(infiniopSwiGLU(
             desc_swiglu, workspace, workspace_size,
-            logits_out->data(), up_buf->data(), gate_buf->data(), stream));
+            gate_buf->data(), up_buf->data(), gate_buf->data(), stream));
+        // gate_buf->debug();
         RUN_INFINI(infiniopGemm(
             desc_ffn_down, workspace, workspace_size,
-            logits_in->data(), logits_out->data(),
+            logits_in->data(), gate_buf->data(),
             rsrc.w_ffn_down[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
+        logits_in->debug();
+        exit(1);
 
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
@@ -374,11 +402,19 @@ inferBatch(struct JiugeModel *model,
     model->req.topk = topk;
     model->req.topp = topp;
 
+    // std::cout << "ntok: " << ntok << " nreq: " << nreq << " len: " << req_lens[0] << " pos: " << req_pos[0] << std::endl;
+
     for (size_t idev = 0; idev < model->dev_ids.size(); idev++) {
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
         model->states[idev].proceed = true;
         lock.unlock();
-        model->states[idev].cv.notify_one();
+        model->states[idev].cv_start.notify_one();
+    }
+    for (size_t i = model->dev_ids.size(); i > 0; i--) {
+        auto idev = i - 1;
+        std::unique_lock<std::mutex> lock(model->states[idev].mtx);
+        model->states[idev].cv_done.wait(lock, [&] { return !(model->states[idev].proceed); });
+        lock.unlock();
     }
 }
 
@@ -387,15 +423,16 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
     createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm);
     while (true) {
         std::unique_lock<std::mutex> lock(state.mtx);
-        state.cv.wait(lock, [&] { return state.proceed || state.exit_flag; });
+        state.cv_start.wait(lock, [&] { return state.proceed || state.exit_flag; });
         if (state.exit_flag) {
             break;
         }
-
+        // std::cout << "ntok: " << req.ntok << " nreq: " << req.nreq << " len: " << req.req_lens[0] << " pos: " << req.req_pos[0] << std::endl;
         inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.ans, req.temperature, req.topk, req.topp);
 
         state.proceed = false;
         lock.unlock();
+        state.cv_done.notify_one();
     }
 
     infiniopDestroyHandle(rsrc->handle);
@@ -439,7 +476,7 @@ __C void destroyJiugeModel(struct JiugeModel *model) {
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
         model->states[idev].exit_flag = true;
         lock.unlock();
-        model->states[idev].cv.notify_one();
+        model->states[idev].cv_start.notify_one();
     }
 
     for (size_t idev = 0; idev < ndev; idev++) {
