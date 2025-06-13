@@ -1,5 +1,6 @@
 #include "../tensor.hpp"
 #include "../utils.hpp"
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -12,6 +13,44 @@ TensorDesc::create(infiniDtype_t dtype, const std::vector<size_t> &shape,
     infiniopCreateTensorDescriptor(&desc->_desc, shape.size(), shape.data(),
                                    strides.data(), dtype);
     return desc;
+}
+
+std::shared_ptr<TensorDesc>
+TensorDesc::create(infiniDtype_t dtype, const std::vector<size_t> &shape) {
+    auto ndim = shape.size();
+    auto strides = std::vector<ptrdiff_t>(ndim);
+    if (ndim > 0) {
+        strides[ndim - 1] = 1;
+        for (int i = ndim - 2; i >= 0; i--) {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+    }
+    return create(dtype, shape, strides);
+}
+
+std::shared_ptr<TensorDesc>
+TensorDesc::permute(infiniDtype_t dtype, const std::vector<size_t> &shape,
+                    const std::vector<size_t> &order) {
+    ASSERT_EQ(shape.size(), order.size());
+    auto ndim = shape.size();
+    if (ndim == 0) {
+        return create(dtype, shape);
+    }
+    auto actual_shape = std::vector<size_t>(order.size());
+    auto actual_strides = std::vector<ptrdiff_t>(order.size());
+    for (size_t i = 0; i < order.size(); i++) {
+        ASSERT(std::find(order.begin(), order.end(), i) != order.end());
+        actual_shape[i] = shape[order[i]];
+    }
+    actual_strides[ndim - 1] = 1;
+    for (int i = ndim - 2; i >= 0; i--) {
+        actual_strides[i] = actual_strides[i + 1] * actual_shape[i + 1];
+    }
+    auto strides = std::vector<ptrdiff_t>(actual_shape.size());
+    for (size_t i = 0; i < order.size(); i++) {
+        strides[i] = actual_strides[order[i]];
+    }
+    return create(dtype, actual_shape, strides);
 }
 
 TensorDesc::~TensorDesc() {
@@ -60,7 +99,7 @@ std::shared_ptr<Tensor> Tensor::buffer(infiniDtype_t dtype,
 std::shared_ptr<Tensor> Tensor::weight(void *data, infiniDtype_t dtype,
                                        const std::vector<size_t> &shape) {
     std::shared_ptr<Tensor> tensor = std::make_shared<Tensor>();
-    ;
+
     tensor->_dtype = dtype;
     auto ndim = shape.size();
     tensor->_shape = std::vector<size_t>(shape);
@@ -79,6 +118,29 @@ std::shared_ptr<Tensor> Tensor::weight(void *data, infiniDtype_t dtype,
     tensor->_data = tensor->_storage->memory;
     infiniopCreateTensorDescriptor(&tensor->_desc, ndim, tensor->_shape.data(),
                                    strides.data(), dtype);
+    tensor->_offset = 0;
+    return tensor;
+}
+
+std::shared_ptr<Tensor> Tensor::memShare(const std::vector<size_t> &shape, infiniDtype_t dtype) const {
+    size_t size = std::accumulate(shape.begin(), shape.end(), dsize(dtype), std::multiplies<size_t>());
+    ASSERT(size <= this->_storage->size);
+
+    std::shared_ptr<Tensor> tensor = std::make_shared<Tensor>();
+    tensor->_dtype = dtype == INFINI_DTYPE_INVALID ? this->_dtype : dtype;
+    tensor->_shape = std::vector<size_t>(shape);
+    auto ndim = shape.size();
+    auto strides = std::vector<ptrdiff_t>(ndim);
+    if (ndim > 0) {
+        strides[ndim - 1] = 1;
+        for (int i = ndim - 2; i >= 0; i--) {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+    }
+    tensor->_strides = strides;
+    tensor->_storage = this->_storage;
+    infiniopCreateTensorDescriptor(&tensor->_desc, ndim, tensor->_shape.data(),
+                                   tensor->_strides.data(), tensor->_dtype);
     tensor->_offset = 0;
     return tensor;
 }
